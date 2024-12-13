@@ -1,3 +1,12 @@
+
+# INSTALLATION:
+
+```git clone https://github.com/LF-H0/CRAWLER.git```
+``` cd CRAWLER```
+```pip3 -r install requirements.txt```
+
+# USAGE:
+
 Usage: LFOC.py [options]
 
 Options:
