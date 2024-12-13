@@ -1,9 +1,10 @@
-import requests                                                             import re
-import urllib.parse                                                         import optparse
-from threading import Thread
-from queue import Queue
+import aiohttp
+import asyncio
+import re
+import urllib.parse
+import optparse
+from bs4 import BeautifulSoup
 import random
-import time
 
 banner = """
     88 ----- 8888888   88888888   *888888
@@ -14,10 +15,8 @@ banner = """
     8888888  88 -----  88888888   °°88888
 
   -------------- MADE BY LF0 --------------
-    """
+"""
 print(banner)
-
-
 
 def get_arguments():
     parser = optparse.OptionParser()
@@ -26,7 +25,7 @@ def get_arguments():
     parser.add_option("-o", "--output", dest="output_file", help="Specify output file name")
     parser.add_option("-d", "--depth", dest="crawl_depth", type="int", default=5, help="Specify crawl depth (default: 5)")
     parser.add_option("-t", "--threads", dest="num_threads", type="int", default=10, help="Specify number of threads (default: 10)")
-    (options, argumants) = parser.parse_args()
+    (options, arguments) = parser.parse_args()
 
     if not options.target_url:
         print("[-] Please specify URL, -h for help")
@@ -39,29 +38,51 @@ target_domain = urllib.parse.urlparse(target_url).netloc
 target_link = set()
 crawled_link = set()
 
-# List of user agents to be used for randomization
-user_agents = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Edg/91.0.864.64",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Firefox/90.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Safari/537.36"
-]
-
-def get_links(url):
+async def get_robots_txt(url):
+    parsed_url = urllib.parse.urlparse(url)
+    robots_url = f"{parsed_url.scheme}://{parsed_url.netloc}/robots.txt"
     try:
-        # Randomize user agent for each request
-        headers = {'User-Agent': random.choice(user_agents)}
-        response = requests.get(url, headers=headers, timeout=5)
-        return re.findall('(?:href=")(.*?)"', response.content.decode())
-    except:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(robots_url) as response:
+                return await response.text()
+    except Exception as e:
+        print(f"Error fetching robots.txt: {e}")
+        return ""
+
+async def can_crawl(url, robots_txt):
+    if not robots_txt:
+        return True
+    user_agent = "*"
+    lines = robots_txt.splitlines()
+    for line in lines:
+        if line.startswith("User -agent:"):
+            user_agent = line.split(":")[1].strip()
+        elif line.startswith("Disallow:") and user_agent == "*":
+            disallowed_path = line.split(":")[1].strip()
+            if url.startswith(urllib.parse.urljoin(target_url, disallowed_path)):
+                return False
+    return True
+
+async def get_links(url):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                return [link.get('href') for link in soup.find_all('a', href=True)]
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
         return []
 
-def crawl(url, depth):
+async def crawl(url, depth, robots_txt):
     if depth > crawl_depth:
         return
 
-    href_links = get_links(url)
+    if not await can_crawl(url, robots_txt):
+        print(f"[-] Crawling disallowed by robots.txt: {url}")
+        return
+
+    href_links = await get_links(url)
     for link in href_links:
         link = urllib.parse.urljoin(url, link)
 
@@ -71,8 +92,8 @@ def crawl(url, depth):
         if link not in crawled_link:
             crawled_link.add(link)
 
-            # Checking if the link belongs to the target domain
-            if urllib.parse.urlparse(link).netloc == target_domain:
+            # Checking if the link belongs to the target domain or subdomains
+            if target_domain in urllib.parse.urlparse(link).netloc:
                 # Checking if the link ends with any of the specified extensions
                 if exclude_extensions:
                     exclude_list = exclude_extensions.split(",")
@@ -83,7 +104,7 @@ def crawl(url, depth):
                                 file.write(link + "\n")
                         else:
                             print(link)
-                        crawl(link, depth + 1)
+                        await crawl(link, depth + 1, robots_txt)
                 else:
                     target_link.add(link)
                     if output_file:
@@ -91,35 +112,36 @@ def crawl(url, depth):
                             file.write(link + "\n")
                     else:
                         print(link)
-                    crawl(link, depth + 1)
+                    await crawl(link, depth + 1, robots_txt)
 
-def worker(queue):
-    while True:
-        try:
-            url, depth = queue.get()
-            crawl(url, depth)
-            queue.task_done()
-            # Changing IP address every 30 seconds
-            time.sleep(30)
-        except KeyboardInterrupt:
-            print("Crawling interrupted. Exiting.")
-            break
+async def worker(queue, robots_txt):
+    while not queue.empty():
+        url, depth = await queue.get()  # Await the get() method
+        await crawl(url, depth, robots_txt)
+        queue.task_done()
+        # Random delay to avoid getting blocked
+        await asyncio.sleep(random.uniform(0.5, 1.5))
 
-def main():
-    queue = Queue()
-    queue.put((target_url, 0))
+async def main():
+    queue = asyncio.Queue()
+    await queue.put((target_url, 0))
 
+    # Fetch robots.txt
+    robots_txt = await get_robots_txt(target_url)
+
+    tasks = []
     for _ in range(num_threads):
-        thread = Thread(target=worker, args=(queue,))
-        thread.daemon = True
-        thread.start()
+        task = asyncio.create_task(worker(queue, robots_txt))
+        tasks.append(task)
 
-    queue.join()
+    await queue.join()
+    for task in tasks:
+        task.cancel()
 
     print("Crawling completed.")
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("Crawling interrupted. Exiting.")
