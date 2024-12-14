@@ -5,7 +5,7 @@
 
 2 `cd CRAWLER`
 
-3 `pip3 -r install requirements.txt`
+3 `pip3 install -r requirements.txt`
 
 # USAGE:
 
